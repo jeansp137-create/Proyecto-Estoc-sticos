@@ -11,6 +11,8 @@ La GUI sólo captura el trazo y muestra resultados; la lógica estocástica vive
 en HMMEngine.py y la extracción de características en FeatureExtractor.py.
 Los puntos marcados con "HOOK" son donde se conectará el motor HMM.
 """
+import json
+import os
 import sys
 
 import numpy as np
@@ -24,6 +26,31 @@ from PyQt5.QtWidgets import (
 )
 
 import Glifos
+from FeatureExtractor import FeatureExtractor
+from HMMEngine import HMMEngine, posteriores_desde_modelos
+
+RAIZ_PROYECTO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DIR_MODELOS = os.path.join(RAIZ_PROYECTO, "models")
+
+
+def cargar_modelos_hmm(modo):
+    """Carga models/modelos_<modo>.json; si no existe aún, lo entrena desde data/."""
+    ruta = os.path.join(DIR_MODELOS, f"modelos_{modo}.json")
+    if not os.path.exists(ruta):
+        try:
+            sys.path.insert(0, os.path.join(RAIZ_PROYECTO, "scripts"))
+            import entrenar_modelos as em
+            ds = em.cargar_dataset()
+            seqs = em.preparar_secuencias(ds, modo=modo)
+            if seqs:
+                em.guardar_modelos(em.entrenar_modelos(seqs), modo)
+        except Exception:
+            pass
+    if not os.path.exists(ruta):
+        return {}
+    with open(ruta, encoding="utf-8") as f:
+        datos = json.load(f)
+    return {c: HMMEngine.desde_dict(d) for c, d in datos.get("letras", {}).items()}
 
 try:
     import pyqtgraph.opengl as gl
@@ -254,6 +281,9 @@ class SphereViewFallback(QWidget):
         rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
         return rx @ ry
 
+    def view_rotation(self):
+        return self._rot()
+
     def _geom(self):
         c = QPointF(self.width() / 2, self.height() / 2)
         r = min(self.width(), self.height()) / 2 * 0.86
@@ -452,6 +482,11 @@ class SphereViewGL(gl.GLViewWidget if HAS_GL else QWidget):
     def reset_view(self):
         self.setCameraPosition(distance=4.2, elevation=20, azimuth=30)
         self._refresh()
+
+    def view_rotation(self):
+        """Matriz 3x3 que transforma puntos del mundo al marco de la cámara."""
+        m = np.array(self.viewMatrix().data(), dtype=float).reshape(4, 4).T
+        return m[:3, :3]
 
     def clear(self):
         self.points = []
@@ -983,9 +1018,12 @@ class GuideView(QWidget):
 class RecognizerView(QWidget):
     """Estructura común: lienzo a la izquierda, probabilidades a la derecha."""
 
-    def __init__(self, titulo, sub, canvas, hint, nav):
+    def __init__(self, titulo, sub, canvas, hint, nav, modo="2d"):
         super().__init__()
         self.canvas = canvas
+        self.modo = modo
+        self.extractor = FeatureExtractor()
+        self.modelos = cargar_modelos_hmm(modo)
         root = QVBoxLayout(self)
         root.setContentsMargins(48, 40, 48, 36)
         root.setSpacing(10)
@@ -1035,10 +1073,37 @@ class RecognizerView(QWidget):
         self.panel.reset()
 
     def on_stroke(self, pts):
-        """HOOK: aquí se invocará FeatureExtractor + HMMEngine (Forward) y se
-        llamará a panel.update_probabilities(...) y canvas.set_projection(...)."""
-        if not pts:
+        """Evalúa Forward en tiempo real y proyecta la trayectoria futura (Viterbi)."""
+        if not pts or len(pts) < 2 or not self.modelos:
             self.panel.reset()
+            return
+
+        if self.modo == "2d":
+            O = self.extractor.simbolos_2d(pts)
+        else:
+            rot = self.canvas.view_rotation() if hasattr(self.canvas, "view_rotation") else None
+            O = self.extractor.simbolos_3d(pts, rot=rot)
+
+        if len(O) == 0:
+            return
+
+        probs = posteriores_desde_modelos(self.modelos, O)
+        self.panel.update_probabilities(probs)
+
+        mejor = max(probs, key=probs.get)
+        futuros = self.modelos[mejor].simbolos_futuros(O)
+        if not futuros:
+            for c in sorted(probs, key=probs.get, reverse=True)[1:4]:
+                cand = self.modelos[c].simbolos_futuros(O)
+                if cand:
+                    futuros = cand
+                    break
+        if self.modo == "2d":
+            proy = self.extractor.proyectar_2d(pts[-1], futuros)
+        else:
+            rot = self.canvas.view_rotation() if hasattr(self.canvas, "view_rotation") else None
+            proy = self.extractor.proyectar_3d(pts[-1], futuros, rot=rot)
+        self.canvas.set_projection(proy)
 
 
 class MainWindow(QMainWindow):
@@ -1063,10 +1128,11 @@ class MainWindow(QMainWindow):
         self.home = HomeView(self.ir)
         self.view_2d = RecognizerView(
             "Modo 2D", "Plano cartesiano", DrawingCanvas(),
-            "Mantén presionado el clic izquierdo para trazar.", self.ir)
+            "Mantén presionado el clic izquierdo para trazar.", self.ir, modo="2d")
         self.view_3d = RecognizerView(
             "Modo 3D", "Superficie esférica", sphere,
-            "Clic izquierdo sobre la esfera: trazar. Clic derecho: rotar. Rueda: zoom.", self.ir)
+            "Clic izquierdo sobre la esfera: trazar. Clic derecho: rotar. Rueda: zoom.",
+            self.ir, modo="3d")
         self.guia = GuideView()
         for v in (self.home, self.view_2d, self.view_3d, self.guia):
             self.stack.addWidget(v)
