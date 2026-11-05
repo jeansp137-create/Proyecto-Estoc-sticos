@@ -156,34 +156,35 @@ class GlyphWidget(QWidget):
 
 # ---------------------------------------------------------------- 2D
 class DrawingCanvas(QWidget):
-    """Lienzo 2D: hoja blanca, trazo negro y proyección punteada verde."""
+    """Lienzo 2D: soporta múltiples trazos por letra (t, f, i, j, q, ñ, x, k)
+    y proyecta la trayectoria futura estimada en verde punteado."""
 
-    strokeChanged = pyqtSignal(list)  # lista de (x, y) del trazo actual
+    strokeChanged = pyqtSignal(list)  # lista plana de (x, y) de todos los trazos
 
     def __init__(self):
         super().__init__()
         self.setMinimumSize(420, 380)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCursor(Qt.CrossCursor)
-        self.points = []
+        self.strokes = []     # lista de trazos: [[(x, y), ...], ...]
+        self.points = []      # lista plana [(x, y), ...] para el HMM
         self.projection = []
         self._drawing = False
 
     def clear(self):
-        self.points, self.projection = [], []
+        self.strokes, self.points, self.projection = [], [], []
         self.update()
         self.strokeChanged.emit([])
 
     def set_projection(self, pts):
-        """HOOK: recibe la trayectoria futura estimada [(x, y), ...]."""
+        """Recibe la trayectoria futura estimada [(x, y), ...]."""
         self.projection = list(pts)
         self.update()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
-            if not self._drawing and self.points:
-                self.points, self.projection = [], []
             self._drawing = True
+            self.strokes.append([])
             self._add(e.pos())
 
     def mouseMoveEvent(self, e):
@@ -194,7 +195,11 @@ class DrawingCanvas(QWidget):
         self._drawing = False
 
     def _add(self, pos):
-        self.points.append((pos.x(), pos.y()))
+        pt = (pos.x(), pos.y())
+        if not self.strokes:
+            self.strokes.append([])
+        self.strokes[-1].append(pt)
+        self.points.append(pt)
         self.update()
         self.strokeChanged.emit(self.points)
 
@@ -211,13 +216,19 @@ class DrawingCanvas(QWidget):
         p.drawLine(w // 2, 16, w // 2, h - 16)
         p.drawLine(16, h // 2, w - 16, h // 2)
 
-        if not self.points:
+        if not self.strokes:
             p.setPen(QColor("#a8a8a4"))
             p.setFont(font(26))
             p.drawText(self.rect(), Qt.AlignCenter, "Dibuja una letra aquí")
 
         self._trazo(p, self.projection, QColor(ACCENT), 3, Qt.DotLine)
-        self._trazo(p, self.points, QColor(INK), 4, Qt.SolidLine)
+        for trazo in self.strokes:
+            if len(trazo) == 1:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(INK))
+                p.drawEllipse(QPointF(*trazo[0]), 3.5, 3.5)
+            else:
+                self._trazo(p, trazo, QColor(INK), 4, Qt.SolidLine)
 
     @staticmethod
     def _trazo(p, pts, color, w, style):
@@ -253,7 +264,8 @@ class SphereViewFallback(QWidget):
         self.setMinimumSize(420, 380)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCursor(Qt.CrossCursor)
-        self.points = []       # trazo del usuario, lista de np.array(3)
+        self.strokes = []      # lista de trazos: [[np.array(3), ...], ...]
+        self.points = []       # trazo plano, lista de np.array(3)
         self.projection = []   # proyección futura, lista de np.array(3)
         self._drawing = False
         self._cursor = None
@@ -317,7 +329,7 @@ class SphereViewFallback(QWidget):
 
     # ---- API pública
     def clear(self):
-        self.points, self.projection = [], []
+        self.strokes, self.points, self.projection = [], [], []
         self.update()
         self.strokeChanged.emit([])
 
@@ -330,11 +342,10 @@ class SphereViewFallback(QWidget):
     def mousePressEvent(self, e):
         if e.button() != Qt.LeftButton:
             return
-        if self.points:
-            self.points, self.projection = [], []
         if self._pick(e.pos()) is None:
             return
         self._drawing = True
+        self.strokes.append([])
         self._add(e.pos())
 
     def mouseMoveEvent(self, e):
@@ -348,20 +359,24 @@ class SphereViewFallback(QWidget):
 
     def _add(self, pos):
         self._cursor = QPointF(pos)
-        pt = self._pick(pos, clamp=bool(self.points))
+        if not self.strokes:
+            self.strokes.append([])
+        cur = self.strokes[-1]
+        pt = self._pick(pos, clamp=bool(cur))
         if pt is None:
             return
-        if self.points:
-            a = self.points[-1]
+        if cur:
+            a = cur[-1]
             ang = float(np.arccos(np.clip(a @ pt, -1.0, 1.0)))
             n = max(1, int(ang / 0.02))
             if ang > 1e-9:
-                # interpolación esférica (slerp): arco de círculo máximo
                 for k in range(1, n + 1):
                     t = k / n
-                    self.points.append(
-                        (np.sin((1 - t) * ang) * a + np.sin(t * ang) * pt) / np.sin(ang))
+                    p_interp = (np.sin((1 - t) * ang) * a + np.sin(t * ang) * pt) / np.sin(ang)
+                    cur.append(p_interp)
+                    self.points.append(p_interp)
         else:
+            cur.append(pt)
             self.points.append(pt)
         self.update()
         self.strokeChanged.emit([tuple(float(v) for v in q) for q in self.points])
@@ -389,7 +404,8 @@ class SphereViewFallback(QWidget):
             self._polilinea(p, line)
 
         self._trazo(p, self.projection, QColor(ACCENT), 4.0, dashed=True)
-        self._trazo(p, self.points, QColor(INK), 5.0)
+        for trazo in self.strokes:
+            self._trazo(p, trazo, QColor(INK), 5.0)
 
         if self._drawing and self._cursor is not None:
             p.setBrush(Qt.NoBrush)
@@ -462,7 +478,7 @@ class SphereViewGL(gl.GLViewWidget if HAS_GL else QWidget):
             smooth=False, drawFaces=False, drawEdges=True, glOptions="translucent",
             edgeColor=(0.04, 0.49, 0.35, 0.30)))
         self.line = gl.GLLinePlotItem(pos=np.zeros((2, 3)), width=4, antialias=True,
-                                      color=(0.1, 0.1, 0.1, 1.0))
+                                      mode="lines", color=(0.1, 0.1, 0.1, 1.0))
         self.proj_line = gl.GLLinePlotItem(pos=np.zeros((2, 3)), width=3,
                                            antialias=True, mode="lines",
                                            color=(0.04, 0.49, 0.35, 1.0))
@@ -471,7 +487,8 @@ class SphereViewGL(gl.GLViewWidget if HAS_GL else QWidget):
         self.addItem(self.line)
         self.addItem(self.proj_line)
 
-        self.points = []   # trazo del usuario, lista de np.array(3) unitarios
+        self.strokes = []  # lista de trazos: [[np.array(3), ...], ...]
+        self.points = []   # lista plana de np.array(3) unitarios para el HMM
         self._line_pts = np.zeros((0, 3))
         self._proj_pts = np.zeros((0, 3))
         self._mode = None  # None | "draw" | "orbit" | "super"
@@ -489,6 +506,7 @@ class SphereViewGL(gl.GLViewWidget if HAS_GL else QWidget):
         return m[:3, :3]
 
     def clear(self):
+        self.strokes = []
         self.points = []
         self._line_pts = np.zeros((0, 3))
         self._proj_pts = np.zeros((0, 3))
@@ -561,9 +579,8 @@ class SphereViewGL(gl.GLViewWidget if HAS_GL else QWidget):
         self._last = QPointF(e.pos())
         if e.button() == Qt.LeftButton:
             if self._pick(e.pos()) is not None:
-                if self.points:
-                    self.clear()
                 self._mode = "draw"
+                self.strokes.append([])
                 self._add(e.pos())
             else:
                 self._mode = "orbit"
@@ -588,23 +605,47 @@ class SphereViewGL(gl.GLViewWidget if HAS_GL else QWidget):
             super().mouseReleaseEvent(e)
         self._mode = None
 
+    @staticmethod
+    def _strokes_to_segments(strokes):
+        segs = []
+        for trazo in strokes:
+            if len(trazo) == 1:
+                p = trazo[0]
+                d = np.array([0.015, 0.0, 0.0])
+                q = (p + d) / np.linalg.norm(p + d)
+                segs.extend([p, q])
+            elif len(trazo) >= 2:
+                arr = np.asarray(trazo, dtype=float)
+                idx = np.empty(2 * (len(arr) - 1), dtype=int)
+                idx[0::2] = np.arange(len(arr) - 1)
+                idx[1::2] = np.arange(1, len(arr))
+                segs.append(arr[idx])
+        if not segs:
+            return np.zeros((0, 3))
+        return np.vstack(segs)
+
     def _add(self, pos):
         pt = self._pick(pos)
         if pt is None:
             return
-        if self.points:
-            a = self.points[-1]
+        if not self.strokes:
+            self.strokes.append([])
+        cur = self.strokes[-1]
+        if cur:
+            a = cur[-1]
             ang = float(np.arccos(np.clip(a @ pt, -1.0, 1.0)))
             if ang < 1e-6:
                 return
             n = max(1, int(ang / 0.02))
             for k in range(1, n + 1):
                 t = k / n
-                self.points.append(
-                    (np.sin((1 - t) * ang) * a + np.sin(t * ang) * pt) / np.sin(ang))
+                p_interp = (np.sin((1 - t) * ang) * a + np.sin(t * ang) * pt) / np.sin(ang)
+                cur.append(p_interp)
+                self.points.append(p_interp)
         else:
+            cur.append(pt)
             self.points.append(pt)
-        self._line_pts = np.array(self.points)
+        self._line_pts = self._strokes_to_segments(self.strokes)
         self._refresh()
         self.strokeChanged.emit([tuple(float(v) for v in q) for q in self.points])
 
