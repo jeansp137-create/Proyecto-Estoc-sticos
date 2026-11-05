@@ -12,6 +12,10 @@ Algoritmos (notación de clase):
     baum_welch        re-estimación (EM) de A, B, pi
     simbolos_futuros  proyección de la trayectoria futura (sección 3.5)
 
+Soporta además variantes de trazo por carácter (`submodelos`), ya que una
+misma letra (por ejemplo 'd' o 'i') se escribe en el dataset tanto en 1 trazo
+como en 2 trazos o en direcciones opuestas.
+
 Este módulo no importa nada de la interfaz: puede probarse solo.
 """
 import numpy as np
@@ -22,15 +26,25 @@ EPS = 1e-300
 class HMMEngine:
     """HMM discreto izquierda-derecha (Bakis) con K símbolos de observación."""
 
-    def __init__(self, A, B, pi, duraciones=None):
+    def __init__(self, A, B, pi, duraciones=None, submodelos=None):
         self.A = np.asarray(A, dtype=float)
         self.B = np.asarray(B, dtype=float)
         self.pi = np.asarray(pi, dtype=float)
         self.N, self.K = self.B.shape
-        # tiempo medio que el modelo pasa en cada estado (para la proyección)
         self.duraciones = (np.asarray(duraciones, dtype=float)
                            if duraciones is not None
                            else 1.0 / np.maximum(1e-3, 1.0 - np.diag(self.A)))
+        # Variantes de estilo (cada una es un HMMEngine puro)
+        self.submodelos = list(submodelos) if submodelos else []
+
+    def _variantes(self):
+        return self.submodelos if self.submodelos else [self]
+
+    def _mejor_variante(self, O):
+        variantes = self._variantes()
+        if len(variantes) == 1 or len(O) == 0:
+            return variantes[0]
+        return max(variantes, key=lambda m: m._log_verosimilitud_simple(O))
 
     # ------------------------------------------------------------ construcción
     @classmethod
@@ -86,12 +100,17 @@ class HMMEngine:
             alpha[t] = a / c[t]
         return alpha, c
 
-    def log_verosimilitud(self, O):
-        """log P(O_1:t | lambda) usando el algoritmo Forward."""
+    def _log_verosimilitud_simple(self, O):
         if len(O) == 0:
             return 0.0
         _, c = self.forward(O)
         return float(np.sum(np.log(c)))
+
+    def log_verosimilitud(self, O):
+        """log P(O_1:t | lambda_c) usando el algoritmo Forward."""
+        if len(O) == 0:
+            return 0.0
+        return max(m._log_verosimilitud_simple(O) for m in self._variantes())
 
     # ------------------------------------------------------------ backward
     def backward(self, O, c):
@@ -108,14 +127,7 @@ class HMMEngine:
         return beta
 
     # ------------------------------------------------------------ viterbi
-    def viterbi(self, O):
-        """Camino de estados ocultos más probable Q* = {q*_1, ..., q*_t}.
-
-        delta_1(i) = pi_i b_i(O_1)
-        delta_t(j) = max_i [ delta_{t-1}(i) a_ij ] b_j(O_t)
-        psi_t(j)   = argmax_i [ delta_{t-1}(i) a_ij ]
-        (en logaritmos). Devuelve (camino, log-probabilidad del camino).
-        """
+    def _viterbi_simple(self, O):
         T = len(O)
         with np.errstate(divide="ignore"):
             logA = np.log(np.maximum(self.A, EPS))
@@ -134,8 +146,12 @@ class HMMEngine:
             camino[t] = psi[t + 1, camino[t + 1]]
         return camino, float(delta[-1].max())
 
+    def viterbi(self, O):
+        """Camino de estados ocultos más probable Q* = {q*_1, ..., q*_t}."""
+        return self._mejor_variante(O)._viterbi_simple(O)
+
     # ------------------------------------------------------------ Baum-Welch
-    def baum_welch(self, secuencias, iteraciones=12, tol=1e-4, suavizado=1e-3):
+    def baum_welch(self, secuencias, iteraciones=10, tol=1e-4, suavizado=0.012):
         """Entrena (A, B, pi) maximizando la verosimilitud (algoritmo EM).
 
         gamma_t(i) = alpha_t(i) beta_t(i) / sum_j alpha_t(j) beta_t(j)
@@ -184,49 +200,50 @@ class HMMEngine:
 
     # ------------------------------------------------------------ proyección
     def simbolos_futuros(self, O, maximo=60):
-        """Símbolos restantes {O_{t+1}, ..., O_T} de la trayectoria aprendida.
-
-        1. Con Viterbi se ubica el estado actual q_t y cuánto lleva en él.
-        2. Se completa la permanencia en ese estado (duración media aprendida).
-        3. Se recorren los estados siguientes emitiendo, en cada uno, el
-           símbolo más probable argmax_k b_j(k) durante su duración media.
-        """
+        """Símbolos restantes {O_{t+1}, ..., O_T} de la trayectoria aprendida."""
         if len(O) == 0:
             return []
-        camino, _ = self.viterbi(O)
+        m = self._mejor_variante(O)
+        camino, _ = m._viterbi_simple(O)
         i = int(camino[-1])
         llevo = 1
         while llevo < len(camino) and camino[-1 - llevo] == i:
             llevo += 1
         futuros = []
-        resta = max(0, int(round(self.duraciones[i])) - llevo)
-        futuros += [int(np.argmax(self.B[i]))] * resta
-        for j in range(i + 1, self.N):
-            futuros += [int(np.argmax(self.B[j]))] * max(1, int(round(self.duraciones[j])))
+        resta = max(0, int(round(m.duraciones[i])) - llevo)
+        futuros += [int(np.argmax(m.B[i]))] * resta
+        for j in range(i + 1, m.N):
+            futuros += [int(np.argmax(m.B[j]))] * max(1, int(round(m.duraciones[j])))
         return futuros[:maximo]
 
     # ------------------------------------------------------------ persistencia
     def a_dict(self):
-        return {
+        d = {
             "A": np.round(self.A, 6).tolist(),
             "B": np.round(self.B, 6).tolist(),
             "pi": np.round(self.pi, 6).tolist(),
             "duraciones": np.round(self.duraciones, 3).tolist(),
         }
+        if self.submodelos and len(self.submodelos) > 1:
+            d["variantes"] = [
+                {
+                    "A": np.round(m.A, 6).tolist(),
+                    "B": np.round(m.B, 6).tolist(),
+                    "pi": np.round(m.pi, 6).tolist(),
+                    "duraciones": np.round(m.duraciones, 3).tolist(),
+                }
+                for m in self.submodelos
+            ]
+        return d
 
     @classmethod
     def desde_dict(cls, d):
-        return cls(d["A"], d["B"], d["pi"], d.get("duraciones"))
+        subs = [cls(v["A"], v["B"], v["pi"], v.get("duraciones")) for v in d.get("variantes", [])]
+        return cls(d["A"], d["B"], d["pi"], d.get("duraciones"), submodelos=subs)
 
 
 def posteriores_desde_modelos(modelos, O, temperatura=None):
-    """Evalúa P(c | O_1:t) para todas las letras usando Forward y Bayes.
-
-    Con prior uniforme P(c) = 1/|C|:
-        P(c | O) = exp(ll_c / tau) / sum_{c'} exp(ll_{c'} / tau)
-    donde tau suaviza la escala por longitud de secuencia para que las barras
-    de probabilidad sean informativas paso a paso.
-    """
+    """Evalúa P(c | O_1:t) para todas las letras usando Forward y Bayes."""
     if len(O) == 0 or not modelos:
         return {c: 0.0 for c in modelos}
     letras = list(modelos.keys())

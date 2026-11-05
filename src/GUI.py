@@ -43,7 +43,7 @@ def cargar_modelos_hmm(modo):
             ds = em.cargar_dataset()
             seqs = em.preparar_secuencias(ds, modo=modo)
             if seqs:
-                em.guardar_modelos(em.entrenar_modelos(seqs), modo)
+                em.guardar_modelos(em.entrenar_modelos(seqs, modo=modo), modo)
         except Exception:
             pass
     if not os.path.exists(ruta):
@@ -1119,11 +1119,12 @@ class RecognizerView(QWidget):
             self.panel.reset()
             return
 
+        entrada = getattr(self.canvas, "strokes", None) or pts
         if self.modo == "2d":
-            O = self.extractor.simbolos_2d(pts)
+            O = self.extractor.simbolos_2d(entrada)
         else:
             rot = self.canvas.view_rotation() if hasattr(self.canvas, "view_rotation") else None
-            O = self.extractor.simbolos_3d(pts, rot=rot)
+            O = self.extractor.simbolos_3d(entrada, rot=rot)
 
         if len(O) == 0:
             return
